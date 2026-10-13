@@ -1,0 +1,16 @@
+{
+  "name": "spotify-render-proxy-server",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Authenticated forward proxy for Render (WebSocket tunnel + plain HTTP/CONNECT)",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}

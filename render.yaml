@@ -1,0 +1,21 @@
+services:
+  - type: web
+    name: spotify-proxy
+    runtime: node
+    plan: free                       # 常時使うなら starter 以上を推奨 (free は15分無通信でスリープ)
+    rootDir: server
+    buildCommand: npm install --omit=dev
+    startCommand: npm start
+    healthCheckPath: /healthz
+    autoDeploy: true
+    envVars:
+      - key: NODE_VERSION
+        value: 20.11.1
+      - key: PROXY_TOKEN
+        generateValue: true          # Render がランダムな文字列を自動生成する
+      - key: PUBLIC
+        value: "0"                   # 1 にすると認証なし=オープンプロキシになる。絶対に変えないこと
+      - key: MAX_TUNNELS
+        value: "50"
+      - key: CONNECT_TIMEOUT
+        value: "10000"

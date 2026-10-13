@@ -1,0 +1,17 @@
+{
+  "name": "spotify-render-proxy",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Render 上に認証付きフォワードプロキシを立て、そこ経由で Spotify を開く一式",
+  "scripts": {
+    "server": "node server/index.js",
+    "client": "node client/index.js",
+    "install:all": "cd server && npm install && cd ../client && npm install",
+    "test": "bash _test/run.sh",
+    "test:auth": "bash _test/run3.sh",
+    "test:direct": "bash _test/run4.sh"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
