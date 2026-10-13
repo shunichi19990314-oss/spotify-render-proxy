@@ -4,6 +4,9 @@
 
 > 📘 **デプロイ手順はこちら → [`DEPLOY.md`](DEPLOY.md)**
 > （スクリーンショット級の詳しさで、ゼロから Spotify が開くところまで書いてあります）
+>
+> 🌐 **ローカルに何もインストールせず、Render の URL だけで Spotify Web Player を開きたい場合**
+> → [`WEBPLAYER.md`](WEBPLAYER.md)（モードC: リバースプロキシ方式）
 
 ```
  あなたのPC                                        Render (Web Service)
@@ -17,7 +20,34 @@
 └────────────────────────────┘                └──────────────────────────────┘
 ```
 
-## なぜ「WebSocket に包む」のか
+## 3つのモード
+
+| | モードA: WSトンネル | モードB: 直接HTTPプロキシ | **モードC: Web Player リバースプロキシ** |
+|---|---|---|---|
+| 必要なもの | ローカルで `client` を起動 | クライアント側でプロキシ指定 | **ブラウザだけ（何も不要）** |
+| 使い方 | ブラウザのプロキシ設定 | `curl -x` 等 | **Render の URL を開くだけ** |
+| Spotify がブロックされた環境 | ✅ | ✅ | ✅ |
+| 音声再生 | ✅ **検証済み** | ✅ **検証済み** | ⚠️ **未検証（Widevine DRM）** |
+| 詳細 | 本ファイル | 本ファイル | [`WEBPLAYER.md`](WEBPLAYER.md) |
+
+3モードは**同一サービス内で共存**しているので、1回デプロイすれば全部使えます。
+
+**モードC の URL:**
+
+| URL | 用途 |
+|---|---|
+| `https://<app>.onrender.com/` | Spotify Web Player 本体 |
+| `https://<app>.onrender.com/__gate__` | 認証（PROXY_TOKEN を入力） |
+| `https://<app>.onrender.com/__diag__` | **診断ページ**（不具合の切り分けに） |
+
+> ⚠️ モードC は**プロキシ層（HTML/JS/API/画像/WS/認証）を 35 項目すべて実 Spotify に対して検証済み**ですが、
+> **実際に音が鳴るかは未検証**です。Spotify Web Player は Shaka Player + 実 Widevine を使うため、
+> ライセンスサーバが non-Spotify オリジンを拒否する可能性があります。
+> 確実性を求めるならモードA を使ってください（検証済み）。
+
+---
+
+## なぜモードAで「WebSocket に包む」のか
 
 Render のエッジ LB は **HTTP/1.1 のリクエストと WebSocket** しか通しません。
 ブラウザが普通のプロキシとして使う `CONNECT` メソッドは、そのままでは LB に弾かれます。
@@ -57,11 +87,13 @@ Render のエッジ LB は **HTTP/1.1 のリクエストと WebSocket** しか�
 ```
 spotify-render-proxy/
 ├── DEPLOY.md                # ★ デプロイ手順（完全版）
+├── WEBPLAYER.md             # ★ モードC (Web Player を Render 上で開く) の解説
 ├── render.yaml              # Render Blueprint（これを渡すだけでデプロイできる）
 ├── .env.example             # 環境変数の一覧と説明
 ├── .gitignore
 ├── server/                  # ★ Render にデプロイする側
 │   ├── index.js             #    プロキシ本体（WS トンネル + 直接 HTTP/CONNECT）
+│   ├── webplayer.js         #    モードC: Web Player リバースプロキシ + SW + 認証ゲート
 │   └── package.json
 ├── client/                  # ★ 自分のPCで動かす側
 │   ├── index.js             #    ローカル HTTP(8888) / SOCKS5(1080) プロキシ
@@ -75,6 +107,8 @@ spotify-render-proxy/
     ├── run.sh               #    端到端の統合テスト（実 Spotify にもアクセスします）
     ├── run3.sh              #    認証まわりのテスト
     ├── run4.sh              #    直接 HTTP プロキシ（モードB）のテスト
+    ├── run5.sh              #    モードC (Web Player リバースプロキシ) のテスト
+    ├── webplayer.js         #    モードC の検証 (35項目)
     ├── probe.js             #    検証本体
     ├── echo.js              #    ローカルのエコーサーバ (HTTP / TCP / TLS自己署名)
     ├── kill.js              #    テスト用プロセスの後始末

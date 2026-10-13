@@ -30,12 +30,14 @@ const net = require('net');
 const crypto = require('crypto');
 const { URL } = require('url');
 const { WebSocketServer } = require('ws');
+const { createWebPlayer } = require('./webplayer');
 
 const PORT = Number(process.env.PORT || 8080);
 const TOKEN = process.env.PROXY_TOKEN || '';
 const PUBLIC = process.env.PUBLIC === '1';
 const CONNECT_TIMEOUT = Number(process.env.CONNECT_TIMEOUT || 10_000);
 const MAX_BODY = 8 * 1024 * 1024;
+const WEBPLAYER = process.env.WEBPLAYER !== '0';   // 0 で Web Player リバースプロキシを無効化
 
 const ts = () => new Date().toISOString();
 const log = (...a) => console.log(ts(), ...a);
@@ -115,13 +117,20 @@ function safePipe(src, dst) {
 }
 
 // ------------------------------------------------------------- HTTP server
+const webplayer = createWebPlayer({ log, warn, tokenOk, PUBLIC, verbose: process.env.VERBOSE === '1' });
+
 const server = http.createServer((req, res) => {
   const path = (req.url || '').split('?')[0];
 
-  // Render のヘルスチェック
-  if (path === '/healthz' || path === '/health' || path === '/') {
+  // Render のヘルスチェック ( '/' は Web Player に譲るので含めない )
+  if (path === '/healthz' || path === '/health' || path === '/__status__') {
     res.writeHead(200, { 'content-type': 'text/plain; charset=utf-8' });
-    res.end('spotify-render-proxy ok\n');
+    res.end(
+      'spotify-render-proxy ok\n' +
+      `  webplayer : ${WEBPLAYER ? 'enabled  ( / = Spotify Web Player, /__gate__ = 認証, /__diag__ = 診断 )' : 'disabled'}\n` +
+      `  tunnel    : wss://<host>/tunnel\n` +
+      `  mode      : ${PUBLIC ? 'PUBLIC(no-auth)' : 'token'}\n`,
+    );
     return;
   }
 
@@ -195,6 +204,9 @@ const server = http.createServer((req, res) => {
     req.on('error', () => { aborted = true; });
     return;
   }
+
+  // (C) Spotify Web Player リバースプロキシ
+  if (WEBPLAYER && webplayer.handle(req, res)) return;
 
   res.writeHead(404, { 'content-type': 'text/plain; charset=utf-8' });
   res.end('not found (this endpoint is a proxy, see README)\n');
@@ -358,6 +370,12 @@ wss.on('connection', (ws, req) => {
 // WS のハンドシェイク (subprotocol でトークンを受ける)
 server.on('upgrade', (req, socket, head) => {
   const path = (req.url || '').split('?')[0];
+
+  // (C) Web Player の WebSocket プロキシ (dealer.spotify.com 等)
+  if (WEBPLAYER && path.startsWith('/__ws__/')) {
+    if (webplayer.handleUpgrade(req, socket, head)) return;
+  }
+
   if (path !== '/tunnel') {
     socket.write('HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n');
     socket.destroy();

@@ -38,3 +38,7 @@ services:
         value: "50"
       - key: CONNECT_TIMEOUT
         value: "10000"
+      # Spotify Web Player を Render のオリジン上で開くリバースプロキシ (モードC)
+      # 0 にすると無効化され、従来のトンネル方式 (モードA/B) だけになる
+      - key: WEBPLAYER
+        value: "1"

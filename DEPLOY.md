@@ -348,6 +348,18 @@ Firefox だけが **OS と独立したプロキシ設定**を持ちます。
 
 ## Step 8: Spotify を開く
 
+> 🌐 **ローカルで `client` を起動したくない場合**
+> モードC（リバースプロキシ）なら **Render の URL をブラウザで開くだけ**で
+> Spotify Web Player が使えます。→ [`WEBPLAYER.md`](WEBPLAYER.md)
+>
+> ```
+> https://<アプリ名>.onrender.com/          ← Web Player
+> https://<アプリ名>.onrender.com/__gate__  ← 初回のトークン入力
+> https://<アプリ名>.onrender.com/__diag__  ← 調子がおかしいときの診断
+> ```
+> ⚠️ ただし**実際に音が鳴るかは未検証**です（Widevine DRM の制約）。
+> 確実なのは下記のモードAです。
+
 ```
 https://open.spotify.com/
 ```

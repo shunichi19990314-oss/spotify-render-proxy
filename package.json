@@ -9,7 +9,8 @@
     "install:all": "cd server && npm install && cd ../client && npm install",
     "test": "bash _test/run.sh",
     "test:auth": "bash _test/run3.sh",
-    "test:direct": "bash _test/run4.sh"
+    "test:direct": "bash _test/run4.sh",
+    "test:webplayer": "bash _test/run5.sh"
   },
   "engines": {
     "node": ">=18"
