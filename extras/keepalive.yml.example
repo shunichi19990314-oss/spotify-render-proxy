@@ -1,0 +1,41 @@
+name: keepalive
+
+# ─────────────────────────────────────────────────────────────
+# ⚠️ これは「サンプル」です。そのままでは動きません。
+#
+# 有効にするには:
+#   1. このファイルを .github/workflows/keepalive.yml としてコピー
+#   2. 下の <APP_NAME> を Render のアプリ名に置換
+#   3. push
+#
+# 注意:
+#   - 24時間稼働させると 730 時間/月 を消費し、
+#     Render 無料枠の 750 インスタンス時間をほぼ使い切ります。
+#   - GitHub Actions の cron は混雑時に数分遅延することがあります。
+#   - 「常時稼働させたい」だけなら Starter ($7/月) の方が確実です。
+#   - 停止するには .github/workflows/keepalive.yml を削除して push。
+# ─────────────────────────────────────────────────────────────
+
+on:
+  schedule:
+    - cron: '*/10 * * * *'   # 10分ごと（スリープ閾値は15分）
+  workflow_dispatch: {}       # 手動実行ボタンも付ける
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Wake up the Render service
+        run: |
+          URL="https://<APP_NAME>.onrender.com/healthz"
+          echo "pinging $URL ..."
+          # スリープからの復帰には最大1分かかるため、リトライする
+          for i in 1 2 3 4 5 6; do
+            CODE=$(curl -sS -m 90 -o /tmp/body -w "%{http_code}" "$URL" || echo "000")
+            BODY=$(cat /tmp/body 2>/dev/null | head -1)
+            echo "attempt $i -> HTTP $CODE : $BODY"
+            if [ "$CODE" = "200" ]; then echo "OK: service is awake"; exit 0; fi
+            sleep 15
+          done
+          echo "::warning::service did not respond with 200"

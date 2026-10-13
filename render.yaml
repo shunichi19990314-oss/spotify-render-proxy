@@ -2,19 +2,38 @@ services:
   - type: web
     name: spotify-proxy
     runtime: node
-    plan: free                       # 常時使うなら starter 以上を推奨 (free は15分無通信でスリープ)
+
+    # ---- コンピュートプラン ------------------------------------------
+    # free    : 15分無通信でスリープ。復帰に約1分。試用向け。
+    # starter : $7/月。常時稼働（スリープなし）。毎日使うならこちら。
+    # ※ プランを上げても「帯域」は増えません。帯域はワークスペース側
+    #    (Hobby 5GB / Pro 25GB) で決まります。詳細は DEPLOY.md 参照。
+    plan: free
+
+    # ---- リージョン（＝出口IPの国）-----------------------------------
+    # 未指定だと oregon (米国西部) になります。
+    # Spotify からは「このリージョンのIPでアクセスしているユーザー」として
+    # 見えるため、カタログや地域判定に直結します。
+    # 日本からのレイテンシ重視なら singapore を推奨。
+    # 有効値: oregon / ohio / virginia / frankfurt / singapore / sydney
+    # region: singapore
+
     rootDir: server
     buildCommand: npm install --omit=dev
     startCommand: npm start
     healthCheckPath: /healthz
-    autoDeploy: true
+
+    # push のたびに自動デプロイ
+    # (旧 autoDeploy: true は非推奨。autoDeployTrigger が現行フィールド)
+    autoDeployTrigger: commit
+
     envVars:
       - key: NODE_VERSION
         value: 20.11.1
       - key: PROXY_TOKEN
-        generateValue: true          # Render がランダムな文字列を自動生成する
+        generateValue: true          # Render が base64 の 256bit 乱数を自動生成
       - key: PUBLIC
-        value: "0"                   # 1 にすると認証なし=オープンプロキシになる。絶対に変えないこと
+        value: "0"                   # 1 = 認証なし(オープンプロキシ)。絶対に変えない
       - key: MAX_TUNNELS
         value: "50"
       - key: CONNECT_TIMEOUT
