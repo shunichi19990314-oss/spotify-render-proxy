@@ -1,6 +1,11 @@
 #!/bin/bash
 # 端到端の動作検証 (ローカルで server/client を立てて probe を流す)
 node _test/kill.js > /dev/null 2>&1; sleep 1; rm -f /tmp/*.log
+# 自己署名証明書 (TLS エンドツーエンド検証用)。無ければ生成する
+if [ ! -f /tmp/key.pem ] || [ ! -f /tmp/cert.pem ]; then
+  openssl req -x509 -newkey rsa:2048 -keyout /tmp/key.pem -out /tmp/cert.pem \
+    -days 2 -nodes -subj "/CN=127.0.0.1" >/dev/null 2>&1 && echo "(自己署名証明書を生成しました)"
+fi
 node _test/echo.js > /tmp/echo.log 2>&1 &
 (cd server && PORT=18080 PROXY_TOKEN=testtoken123 node index.js) > /tmp/server.log 2>&1 &
 sleep 2
