@@ -548,8 +548,10 @@ function createWebPlayer(o = {}) {
     // ---- 認証チェック
     const auth = getAuth(req);
     if (!auth) {
-      // API/asset には 302 ではなく 401 を返す（SW の fetch が HTML を受け取ると混乱するため）
-      if (pathname.startsWith(P) || pathname.startsWith('/__')) {
+      // API/asset/SW には 302 ではなく 401 を返す。
+      // 302 にすると /sw.js が HTML(ゲートページ) を返し、
+      // ブラウザが「SW の MIME 型が違う」エラーで登録に失敗するため。
+      if (pathname.startsWith(P) || pathname.startsWith('/__') || pathname === '/sw.js') {
         res.writeHead(401, { 'content-type': 'text/plain; charset=utf-8' });
         res.end('[spotify-render-proxy] authentication required. open /__gate__\n');
         return true;
