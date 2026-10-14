@@ -93,36 +93,98 @@ cd spotify-render-proxy
 ==> Your service is live 🎉
 ```
 
-### 方法 B: 手動で Web Service を作る
+### 方法 B: Web Service から手動で作る
 
-Blueprint が使えない場合（別リポジトリにしたい等）はこちら。
+Blueprint を使わず、Web Service として直接作る場合の手順です。
+**`render.yaml` は読まれないので、全項目を手で入力します。**
 
-1. **New +** → **Web Service**
-2. リポジトリ `spotify-render-proxy` を選択 → **Connect**
-3. 以下を**正確に**入力:
+#### B-1. Git プロバイダを連携（初回のみ）
 
-| 項目 | 入力値 |
-|---|---|
-| Name | `spotify-proxy`（任意） |
-| Region | **Singapore**（日本から近い。後述） |
-| Branch | `main` |
-| Root Directory | `server` ← **重要。空にすると動きません** |
-| Runtime | **Node** |
-| Build Command | `npm install --omit=dev` |
-| Start Command | `npm start` |
-| Instance Type / Plan | **Free** |
+1. [Account Settings](https://dashboard.render.com/u/settings#account-security) を開く
+2. **Account Security** セクションまでスクロール
+3. **Git Deployment Credentials** → **Add credential** → GitHub を認証
 
-4. **Advanced** を開いて環境変数を追加:
+> すでに Blueprint 等で連携済みなら不要です。
 
-| Key | Value | 備考 |
+#### B-2. トークンを自分で生成する
+
+Blueprint と違い **`PROXY_TOKEN` は自動生成されません。** 手元で作ってください。
+
+```bash
+# macOS / Linux
+openssl rand -hex 24
+# → 例: 3f9a1c7e5b2d8460af13ce97b5d2048f6a1e7c93b5d20486
+
+# Windows (PowerShell)
+-join ((48..57)+(97..122) | Get-Random -Count 48 | ForEach-Object {[char]$_})
+```
+
+生成した文字列を**メモしておいてください**（Step 5 でクライアントにも使います）。
+
+#### B-3. サービスを作成する
+
+1. ダッシュボード右上の **+ New** → **Web Service**
+2. リポジトリ一覧から **`spotify-render-proxy`** を選ぶ → **Connect**
+3. フォームを以下のように埋める:
+
+| フィールド | 入力値 | 注意 |
 |---|---|---|
-| `PROXY_TOKEN` | *(Generate をクリック)* | Render が自動生成してくれます |
-| `PUBLIC` | `0` | **`1` にしないこと** |
-| `NODE_VERSION` | `20.11.1` | 任意 |
-| `MAX_TUNNELS` | `50` | 任意 |
+| **Name** | `spotify-proxy` | 任意。これが URL になります |
+| **Region** | **Singapore** | 日本から最速。既定は Oregon |
+| **Branch** | `main` | |
+| **Root Directory** | `server` | ⚠️ **最重要。空だと起動失敗します** |
+| **Language** | **Node** | |
+| **Build Command** | `npm install --omit=dev` | |
+| **Start Command** | `npm start` | |
+| **Compute** | **Free** | 常時稼働させたいなら Starter ($7/月) |
 
-5. **Health Check Path** に `/healthz`
-6. **Create Web Service** をクリック
+4. **Advanced** セクションを開く（フォームの下の方）
+
+   **Health Check Path** に `/healthz` を入力
+
+   > Health Check Path は作成フォームでは **Advanced 内**にあります。
+   > 後から設定する場合は サービス → **Settings** → **Health Checks** セクション。
+
+5. 同じく **Advanced** の **Environment Variables** に追加:
+
+   | Key | Value | 備考 |
+   |---|---|---|
+   | `PROXY_TOKEN` | *(B-2 で生成した値)* | **必須** |
+   | `PUBLIC` | `0` | ⚠️ `1` にするとオープンプロキシ化 |
+   | `WEBPLAYER` | `1` | モードC を有効化（既定で 1 なので省略可） |
+   | `NODE_VERSION` | `20.11.1` | 任意 |
+   | `MAX_TUNNELS` | `50` | 任意 |
+
+6. 一番下の **Create Web Service**（または **Deploy**）をクリック
+
+#### B-4. 確認
+
+ビルドが 1〜3 分で走り、ログに次が出れば成功です:
+
+```
+==> Your service is live 🎉
+```
+
+サーバ自身の起動ログにはこう出ます（トークンが効いているか確認できます）:
+
+```
+listening on :10000  mode=token  token=set
+```
+
+> ⚠️ `token=MISSING` と出たら `PROXY_TOKEN` が入っていません。
+> その状態では全リクエストが 401/407 で拒否されます。
+
+#### Blueprint との違い
+
+| | Blueprint（方法A） | Web Service（方法B） |
+|---|---|---|
+| 入力項目 | ほぼ自動 | **全部手入力** |
+| `PROXY_TOKEN` | **自動生成** | **自分で生成** |
+| Root Directory | 自動で `server` | **手入力（間違えやすい）** |
+| `render.yaml` 変更の追従 | する | しない |
+| 削除するとき | Blueprint も消す必要あり | サービスを消すだけ |
+
+**Root Directory の入れ忘れが最多の失敗原因**です。`server` になっているか必ず確認してください。
 
 ### 🌏 リージョンの選び方（重要）
 
