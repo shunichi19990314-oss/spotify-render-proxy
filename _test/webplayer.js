@@ -71,7 +71,8 @@ function check(name, cond, detail) {
   check('CSP ヘッダが除去されている', !r.headers['content-security-policy'], r.headers['content-security-policy'] ? '残っている!' : 'removed');
   check('x-frame-options が除去されている', !r.headers['x-frame-options']);
   check('SW 登録コードが注入されている', html.includes("serviceWorker.register('/sw.js'"));
-  check('shim v3 (同期パッチ) が注入されている', /data-srp-version="3"/.test(html) && html.includes('XMLHttpRequest.prototype.open'));
+  const shimVer = (/data-srp-version="(\d+)"/.exec(html) || [])[1];
+  check('同期パッチ shim が注入されている (v3以降)', Number(shimVer) >= 3 && html.includes('XMLHttpRequest.prototype.open'), `shim v${shimVer}`);
   check('fetch の同期パッチが入っている', html.includes('window.fetch = function'));
   check('画面バッジが注入されている', html.includes('__srp_badge'));
   check('テレメトリ送信が入っている', html.includes('/__report__'));
@@ -80,6 +81,19 @@ function check(name, cond, detail) {
   check('Spotify URL が書き換わっている', rewritten > 5, `/__p__/ が ${rewritten} 箇所`);
   const leftover = (html.match(/https?:\/\/[a-z0-9.-]*(?:spotify\.com|scdn\.co|spotifycdn\.com)/gi) || []);
   check('素の Spotify 絶対URLが残っていない', leftover.length === 0, leftover.length ? `残 ${leftover.length}: ${[...new Set(leftover)].slice(0,3).join(', ')}` : 'clean');
+
+  // ★最重要: 書き換え結果が絶対URLであること。
+  //   相対パスだと Spotify のコードにある base 引数なしの new URL(x) が
+  //   "TypeError: Failed to construct 'URL': Invalid URL" を投げて起動に失敗する。
+  const proxied = [...new Set((html.match(/https?:\/\/[^"'\s)]*\/__p__\/[^"'\s)]*/g) || []))];
+  check('書き換え結果が絶対URLになっている', proxied.length > 0, `${proxied.length}件 例: ${(proxied[0] || '').slice(0, 62)}`);
+  let urlOk = 0;
+  proxied.forEach((u) => { try { new URL(u); urlOk++; } catch { /* */ } });
+  check('全URLが base なし new URL() でパース可能', urlOk === proxied.length, `${urlOk}/${proxied.length}`);
+  // 注入 shim 自身の定数定義 (var PREFIX='/__p__/') は書き換え対象ではないので除外して数える
+  const htmlNoShim = html.replace(/<script data-srp-version="[\s\S]*?<\/script>/g, '');
+  const relLeft = (htmlNoShim.match(/["'=]\/__p__\//g) || []).length;
+  check('相対形の /__p__/ が残っていない (shim定数を除く)', relLeft === 0, relLeft ? `★${relLeft}箇所 残存` : 'clean');
   console.log(`   Set-Cookie: ${(r.headers['set-cookie'] || []).length}個 (Domain除去確認: ${JSON.stringify((r.headers['set-cookie']||[])[0]||'').slice(0,90)})`);
 
   console.log('\n=== 5. Service Worker ===');
@@ -113,9 +127,13 @@ function check(name, cond, detail) {
   // accounts.spotify.com は open.spotify.com/login へ 307 する。Location が
   // /__p__/ 形に書き換わっていれば「リダイレクト先もプロキシ内に閉じている」証拠
   check('accounts.spotify.com が到達', [200, 301, 302, 303, 307].includes(r.status), `HTTP ${r.status}`);
-  check('Location が /__p__/ 形に書き換わっている',
-        !r.headers.location || r.headers.location.startsWith('/__p__/') || r.headers.location.startsWith('/'),
-        `loc=${r.headers.location}`);
+  // Location も「絶対 URL」でなければならない。
+  // 相対だと Spotify 側コードの base 引数なし new URL(x) が Invalid URL で落ちる。
+  const loc = r.headers.location || '';
+  check('Location が絶対URL + /__p__/ 形に書き換わる',
+        !loc || /^https?:\/\/[^/]+\/__p__\//.test(loc), `loc=${loc}`);
+  check('Location が base なし new URL() でパースできる',
+        !loc || (() => { try { new URL(loc); return true; } catch { return false; } })(), `loc=${loc}`);
   check('Location に素の spotify.com が残っていない',
         !/https?:\/\/[a-z0-9.-]*spotify\.com/i.test(r.headers.location || ''), `loc=${r.headers.location}`);
 

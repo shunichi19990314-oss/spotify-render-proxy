@@ -107,20 +107,34 @@ check('shim が例外なく実行された', sb.__srpInstalled === true);
 check('デバッグ用 window.__srp_log が用意された', Array.isArray(sb.__srp_log));
 
 console.log('\n--- fetch の書き換え ---');
+// ★ 書き換え結果は「絶対 URL」でなければならない。
+//   相対パスだと Spotify 側コードの base 引数なし new URL(x) が
+//   TypeError: Failed to construct 'URL': Invalid URL で落ちるため。
+const O = ORIGIN;   // https://spotify-88jy.onrender.com
 const cases = [
-  ['https://api.spotify.com/v1/me', '/__p__/api.spotify.com/v1/me'],
-  ['https://open.spotify.com/playlist/x', '/__p__/open.spotify.com/playlist/x'],
-  ['https://spclient.wg.spotify.com/a/b?c=1', '/__p__/spclient.wg.spotify.com/a/b?c=1'],
-  ['https://i.scdn.co/image/abc', '/__p__/i.scdn.co/image/abc'],
-  ['https://audio-fa.scdn.co/audio/x', '/__p__/audio-fa.scdn.co/audio/x'],
-  ['/local/path', '/local/path'],                                        // 自オリジンはそのまま
+  ['https://api.spotify.com/v1/me', O + '/__p__/api.spotify.com/v1/me'],
+  ['https://open.spotify.com/playlist/x', O + '/__p__/open.spotify.com/playlist/x'],
+  ['https://spclient.wg.spotify.com/a/b?c=1', O + '/__p__/spclient.wg.spotify.com/a/b?c=1'],
+  ['https://i.scdn.co/image/abc', O + '/__p__/i.scdn.co/image/abc'],
+  ['https://audio-fa.scdn.co/audio/x', O + '/__p__/audio-fa.scdn.co/audio/x'],
+  // 同一オリジンの相対パスは Spotify と無関係なので触らない（absoluteOk=false）
+  ['/local/path', '/local/path'],
+  [O + '/__p__/api.spotify.com/x', O + '/__p__/api.spotify.com/x'],        // 既に絶対プロキシ形は不変
   ['https://www.google.com/recaptcha/x', 'https://www.google.com/recaptcha/x'], // 非Spotifyは素通し
 ];
+// Spotify 宛ての書き換え結果は必ず絶対URLでなければならない。
+// 同一オリジンの相対パスは対象外（触らないのが正しい）。
+const spotifyCase = (input) => /spotify\.com|scdn\.co|spotifycdn\.com/.test(input);
 for (const [input, expect] of cases) {
   calls.fetch.length = 0;
   sb.fetch(input);
   const got = calls.fetch.filter((x) => !/^(WARN|ERR):/.test(x))[0];
-  check(`fetch(${input.slice(0, 42)})`, got === expect, `-> ${got}`);
+  check(`fetch(${input.slice(0, 40)})`, got === expect, `-> ${got}`);
+  if (spotifyCase(input)) {
+    // base なし new URL() が通る＝Spotify 側コードで Invalid URL 例外にならない
+    let urlOk = true; try { new URL(got); } catch (e) { urlOk = false; }
+    check('  └ 絶対URL (new URL(x) が通る)', urlOk, urlOk ? '' : '★相対URLのまま!');
+  }
 }
 
 console.log('\n--- Request オブジェクトを渡した場合 ---');
@@ -128,14 +142,14 @@ calls.fetch.length = 0;
 sb.fetch(new sb.Request('https://api.spotify.com/v1/search?q=x'));
 {
   const got = calls.fetch.filter((x) => !/^(WARN|ERR):/.test(x))[0];
-  check('fetch(new Request("https://api.spotify.com/..."))', got === '/__p__/api.spotify.com/v1/search?q=x', `-> ${got}`);
+  check('fetch(new Request("https://api.spotify.com/..."))', got === ORIGIN + '/__p__/api.spotify.com/v1/search?q=x', `-> ${got}`);
 }
 
 console.log('\n--- XMLHttpRequest の書き換え ---');
 {
   const x = new sb.XMLHttpRequest();
   x.open('GET', 'https://api.spotify.com/v1/me');
-  check('XHR.open の URL が書き換わる', calls.xhr[0] === '/__p__/api.spotify.com/v1/me', `-> ${calls.xhr[0]}`);
+  check('XHR.open の URL が書き換わる', calls.xhr[0] === ORIGIN + '/__p__/api.spotify.com/v1/me', `-> ${calls.xhr[0]}`);
 }
 
 console.log('\n--- WebSocket の書き換え ---');
@@ -150,15 +164,15 @@ console.log('\n--- WebSocket の書き換え ---');
 console.log('\n--- sendBeacon / 動的 src ---');
 {
   sb.navigator.sendBeacon('https://pixel.spotify.com/event');
-  check('sendBeacon が書き換わる', calls.beacon[0] === '/__p__/pixel.spotify.com/event', `-> ${calls.beacon[0]}`);
+  check('sendBeacon が書き換わる', calls.beacon[0] === ORIGIN + '/__p__/pixel.spotify.com/event', `-> ${calls.beacon[0]}`);
 
   const img = new sb.HTMLImageElement();
   img.src = 'https://i.scdn.co/image/xyz';
-  check('img.src が書き換わる', img.src === '/__p__/i.scdn.co/image/xyz', `-> ${img.src}`);
+  check('img.src が書き換わる', img.src === ORIGIN + '/__p__/i.scdn.co/image/xyz', `-> ${img.src}`);
 
   const link = new sb.HTMLLinkElement();
   link.href = 'https://encore.scdn.co/a.css';
-  check('link.href が書き換わる', link.href === '/__p__/encore.scdn.co/a.css', `-> ${link.href}`);
+  check('link.href が書き換わる', link.href === ORIGIN + '/__p__/encore.scdn.co/a.css', `-> ${link.href}`);
 }
 
 console.log('\n--- 統計 ---');
@@ -180,7 +194,7 @@ console.log('\n--- テレメトリ (コンソール不要の診断) ---');
 
   // 手動でレポート送信
   sb.__srp_report();
-  check('__srp_report() が sendBeacon を呼ぶ', calls.beacon.includes('/__report__'), `宛先=${calls.beacon[0]}`);
+  check('__srp_report() が sendBeacon を呼ぶ', calls.beacon.includes('/__report__'), `宛先=${calls.beacon.filter(x=>x.includes('__report__'))[0]}`);
   let rep = null;
   try { rep = JSON.parse(calls.beacons[0]); } catch (e) { /* */ }
   check('レポートが JSON として送られる', !!rep);

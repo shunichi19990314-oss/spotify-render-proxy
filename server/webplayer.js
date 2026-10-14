@@ -78,11 +78,36 @@ const STRIP_RES = new Set([
 ]);
 
 // ------------------------------------------------------------------ 本文書き換え
-/** Spotify ドメインへの絶対 URL を、自オリジンのパス prefix 形に書き換える */
-function rewriteText(text) {
-  let out = text.replace(RE_PLAIN, (_m, proto, host) => `${P}${host}`);
-  out = out.replace(RE_ESCAPED, (_m, host) => `\\/__p__\\/${host}`);
+/**
+ * Spotify ドメインへの絶対 URL を、自オリジンのプロキシ URL に書き換える。
+ *
+ * ★ 必ず「絶対 URL」で出力すること。
+ *   相対パス (/__p__/host/...) にすると、Spotify 側のコードにある
+ *   base 引数なしの new URL(x) が
+ *     TypeError: Failed to construct 'URL': Invalid URL
+ *   で例外を投げてアプリ全体が落ちる（実測で確認）。
+ *   特に new URL(i.redirectToUrl) / new URL(p.fetchData.url) は
+ *   サーバ応答 JSON から URL を読むため、JSON 書き換えも絶対である必要がある。
+ *
+ * origin が空（Host ヘッダ不明）の場合のみ相対形にフォールバックする。
+ */
+function rewriteText(text, origin) {
+  const o = origin || '';
+  // JSON エスケープ形 (https:\/\/host) 用にスラッシュをエスケープした origin
+  const oEsc = o.replace(/\//g, '\\/');
+  let out = text.replace(RE_PLAIN, (_m, _proto, host) => `${o}${P}${host}`);
+  out = out.replace(RE_ESCAPED, (_m, host) => `${oEsc}\\/__p__\\/${host}`);
   return out;
+}
+
+/** リクエストから自オリジン (https://host) を組み立てる */
+function originOf(req) {
+  // Render の LB 背後では x-forwarded-proto: https が入る。
+  // ローカルで直接 HTTP 接続した場合は socket の暗号化状態から判定する。
+  const fwd = String(req.headers['x-forwarded-proto'] || '').split(',')[0].trim();
+  const proto = fwd || (req.socket && req.socket.encrypted ? 'https' : 'http');
+  const host = req.headers.host || req.headers['x-forwarded-host'];
+  return host ? `${proto}://${host}` : '';
 }
 
 /**
@@ -98,7 +123,7 @@ function rewriteText(text) {
  *   『同期的に・初回ロードから』書き換えるシムを注入する。
  *   SW は保険として併用する。
  */
-const SRP_VERSION = '3';
+const SRP_VERSION = '4';
 
 const INJECT = `
 <script data-srp-version="${SRP_VERSION}">/* injected by spotify-render-proxy */
@@ -108,6 +133,7 @@ const INJECT = `
 
   var SP = /(^|\\.)(spotify\\.com|scdn\\.co|spotifycdn\\.com|spotilocal\\.com)$/i;
   var PREFIX = '/__p__/';
+  var ABS_PREFIX = location.origin + PREFIX;   // 書き換えは常に絶対 URL で行う
   var WSPREFIX = (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/__ws__/';
   var log = [];
   window.__srp_log = log;                 // コンソールから window.__srp_log で確認できる
@@ -119,16 +145,21 @@ const INJECT = `
     if (kind === 'ESCAPE' && window.console) console.warn('[spotify-proxy] 書き換え漏れ?', from);
   }
 
-  /** 絶対URL -> 自オリジンのプロキシパス */
+  /**
+   * 絶対URL -> 自オリジンのプロキシ URL
+   * ★ 必ず「絶対 URL」を返すこと。相対パスを返すと Spotify 側コードの
+   *   base 引数なし new URL(x) が "Invalid URL" で例外になり起動に失敗する。
+   */
   function rw(u) {
     if (typeof u !== 'string' || !u) return u;
-    if (u.indexOf(PREFIX) === 0) return u;               // 既にプロキシ形
+    if (u.indexOf(ABS_PREFIX) === 0) return u;           // 既にプロキシ形(絶対)
+    if (u.indexOf(PREFIX) === 0) return location.origin + u;  // 相対形は絶対へ補正
     var url;
     try { url = new URL(u, location.href); } catch (e) { return u; }
     if (!url.host) return u;
     if (url.origin === location.origin) return u;        // 自オリジン
     if (!SP.test(url.hostname)) return u;                // Spotify 以外 (Google 等) は素通し
-    var out = PREFIX + url.hostname + url.pathname + url.search;
+    var out = ABS_PREFIX + url.hostname + url.pathname + url.search;
     note('rewrite', u, out);
     return out;
   }
@@ -257,6 +288,7 @@ const INJECT = `
 
   // ---------- (9) サーバへの診断レポート送信 ----------
   var VER = document.currentScript ? document.currentScript.getAttribute('data-srp-version') : '?';
+  window.__srp_ver = VER;   // 診断ページから参照できるようにする
   function snapshot() {
     return {
       v: VER,
@@ -411,72 +443,152 @@ self.addEventListener('fetch', (event) => {
 // ------------------------------------------------------------------ 診断ページ
 function diagPage() {
   return `<!DOCTYPE html><html lang="ja"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
 <title>spotify-render-proxy 診断</title>
 <style>
  body{font:14px/1.6 -apple-system,Segoe UI,Roboto,sans-serif;background:#121212;color:#fff;margin:0;padding:24px}
- h1{font-size:20px} table{border-collapse:collapse;width:100%;max-width:900px;margin-top:12px}
- th,td{border:1px solid #333;padding:8px 10px;text-align:left;vertical-align:top}
- th{background:#1db954;color:#000} code{background:#222;padding:2px 5px;border-radius:3px}
+ h1{font-size:20px;margin:0 0 4px} p{color:#b3b3b3;margin:0 0 16px;font-size:13px}
+ table{border-collapse:collapse;width:100%;max-width:980px;margin-top:12px}
+ th,td{border:1px solid #333;padding:8px 10px;text-align:left;vertical-align:top;word-break:break-all}
+ th{background:#1db954;color:#000}
  .ok{color:#1db954;font-weight:700} .ng{color:#ff4d4d;font-weight:700} .warn{color:#ffb020;font-weight:700}
- button{background:#1db954;color:#000;border:0;padding:10px 18px;border-radius:20px;font-weight:700;cursor:pointer;font-size:14px}
- #log{background:#000;padding:12px;border-radius:6px;max-width:900px;white-space:pre-wrap;font:12px/1.5 monospace;margin-top:12px;max-height:300px;overflow:auto}
- a{color:#1db954}
+ button{background:#1db954;color:#000;border:0;padding:10px 18px;border-radius:20px;font-weight:700;cursor:pointer;font-size:14px;margin-right:8px}
+ button.sec{background:#333;color:#fff}
+ #log{background:#000;padding:12px;border-radius:6px;max-width:980px;white-space:pre-wrap;font:12px/1.5 monospace;margin-top:12px;max-height:340px;overflow:auto}
+ a{color:#1db954} .note{background:#1c1c1c;border-left:3px solid #1db954;padding:10px 12px;max-width:980px;font-size:12px;color:#bbb;margin-top:14px}
 </style></head><body>
-<h1>spotify-render-proxy 診断ページ</h1>
-<p>各 Spotify エンドポイントが<b>このオリジン経由</b>で取得できるかを検査します。</p>
+<h1>🔍 spotify-render-proxy 診断</h1>
+<p>各 Spotify エンドポイントが<b>このオリジン経由</b>で取得できるかを検査します。
+「OK」＝プロキシが正しく中継できている、という意味です。</p>
 <button id="run">検査を実行</button>
-<button id="sw" style="background:#333;color:#fff">SW 状態を確認</button>
-<a href="/"><button style="background:#fff">→ Web Player を開く</button></a>
+<button id="sw" class="sec">SW 状態</button>
+<button id="shim" class="sec">shim 状態</button>
+<a href="/"><button class="sec">→ Web Player</button></a>
+<a href="/__log__"><button class="sec">→ ログ</button></a>
 <table><thead><tr><th>対象</th><th>結果</th><th>詳細</th></tr></thead><tbody id="rows"></tbody></table>
+<div class="note">
+<b>判定の意味</b><br>
+・<span class="ok">OK</span> = プロキシが中継できた（<b>401 / 404 / 307 でも Spotify に到達していれば OK</b>。
+   Spotify 自身が返す応答なので正常です）<br>
+・<span class="ng">NG</span> = プロキシ自体が失敗（<code>502</code> + 本文が <code>[spotify-render-proxy]</code> で始まる）<br>
+・ログインしていない場合、<code>api.spotify.com/v1/me</code> が <b>401</b> になるのは<b>正常</b>です
+</div>
 <div id="log"></div>
 <script>
-const T=[
- ['open.spotify.com (HTML)','${P}open.spotify.com/','text'],
- ['open.spotifycdn.com (JS)','${P}open.spotifycdn.com/cdn/build/web-player/vendor~web-player.b415aea9.js','js'],
- ['api.spotify.com (REST)','${P}api.spotify.com/v1/me','json401'],
- ['spclient.wg.spotify.com','${P}spclient.wg.spotify.com/','any'],
- ['i.scdn.co (画像)','${P}i.scdn.co/image/ab67616d0000b273000b2e1c1c1f0f0a0a0a0a0a','img'],
- ['accounts.spotify.com','${P}accounts.spotify.com/','any'],
-];
-const rows=document.getElementById('rows'),logEl=document.getElementById('log');
-function log(s){logEl.textContent+=s+'\\n';logEl.scrollTop=logEl.scrollHeight;}
-document.getElementById('sw').onclick=async()=>{
-  if(!('serviceWorker' in navigator))return log('Service Worker 非対応ブラウザです');
-  const r=await navigator.serviceWorker.getRegistration('/');
-  log(r?('SW 登録あり: scope='+r.scope+' active='+(!!r.active)+' state='+(r.active&&r.active.state)):'SW 未登録 (page をリロードしてください)');
-  log('controller='+(navigator.serviceWorker.controller?'あり(このページは制御下)':'なし(リロードが必要)'));
-};
-document.getElementById('run').onclick=async()=>{
-  rows.innerHTML='';logEl.textContent='';
-  log('controller='+(navigator.serviceWorker.controller?'あり':'なし'));
-  for(const [name,url,kind] of T){
-    const tr=document.createElement('tr');
-    tr.innerHTML='<td>'+name+'</td><td>…</td><td></td>';rows.appendChild(tr);
-    const t0=performance.now();
-    try{
-      const r=await fetch(url,{cache:'no-store'});
-      const ms=Math.round(performance.now()-t0);
-      const ct=r.headers.get('content-type')||'';
-      let detail='HTTP '+r.status+' / '+ct.slice(0,40)+' / '+ms+'ms';
-      let cls='ok';
-      if(kind==='json401'){
-        const b=await r.text();
-        detail+=' body='+b.slice(0,90);
-        cls=(r.status===401)?'ok':'warn'; // 401 が「届いている」証拠
-      }else if(r.status>=400){ cls='ng'; }
-      else if(kind==='text'){ const b=await r.text(); detail+=' / '+b.length+'B'; if(!/<html/i.test(b))cls='warn'; }
-      else if(kind==='js'){ const b=await r.text(); detail+=' / '+(b.length/1024).toFixed(0)+'KB';
-        detail+=' / 書き換え='+(b.includes('${P}')?'★あり':'なし'); }
-      else if(kind==='img'){ const b=await r.arrayBuffer(); detail+=' / '+b.byteLength+'B'; }
-      tr.children[1].innerHTML='<span class="'+cls+'">'+(cls==='ok'?'OK':cls==='warn'?'WARN':'NG')+'</span>';
-      tr.children[2].textContent=detail;
-      log((cls==='ok'?'[OK]  ':cls==='warn'?'[WARN]':'[NG]  ')+name+' -> '+detail);
-    }catch(e){
-      tr.children[1].innerHTML='<span class="ng">ERR</span>';
-      tr.children[2].textContent=e.message;
-      log('[ERR] '+name+' -> '+e.message);
+const P = '${P}';
+const rows = document.getElementById('rows'), logEl = document.getElementById('log');
+function log(s){ logEl.textContent += s + '\\n'; logEl.scrollTop = logEl.scrollHeight; }
+
+// 私たち自身のプロキシが返すエラーかどうか
+function isProxyError(status, body){
+  return status === 502 && /\\[spotify-render-proxy\\]/.test(body || '');
+}
+
+// 固定リスト + トップページから動的に拾った実在の JS/画像 URL
+async function buildTargets(){
+  const T = [
+    ['open.spotify.com (HTML)',      P+'open.spotify.com/',                                   'html'],
+    ['api.spotify.com (REST)',       P+'api.spotify.com/v1/me',                               'json401'],
+    ['accounts.spotify.com',         P+'accounts.spotify.com/',                               'redirect'],
+    ['spclient.wg.spotify.com',      P+'spclient.wg.spotify.com/',                            'reachable'],
+    ['apresolve.spotify.com',        P+'apresolve.spotify.com/',                              'json'],
+    ['clienttoken.spotify.com',      P+'clienttoken.spotify.com/v1/clienttoken',              'reachable'],
+    ['i.scdn.co (実在する画像)',      P+'i.scdn.co/image/ab67616d00001e02ff9ca10b55ce82ae553c8228','img'],
+  ];
+  try{
+    const r = await fetch('/', {cache:'no-store'});
+    const html = await r.text();
+    const js = (html.match(/src="([^"]+\\.js[^"]*)"/) || [])[1];
+    if (js) T.splice(1, 0, ['JS バンドル (実URL)', js.startsWith('/') ? js : js, 'js']);
+    const img = (html.match(/https?:\\/\\/[a-z0-9.\\-]*scdn\\.co\\/[^"')\\s]+/) || [])[0];
+    if (img) T.push(['画像 (HTML内から抽出)', img, 'img']);
+    T.push(['HTMLの書き換え状況', '/', 'rewriteCount']);
+  }catch(e){ log('[warn] トップページ取得失敗: ' + e.message); }
+  return T;
+}
+
+async function runOne(name, url, kind){
+  const tr = document.createElement('tr');
+  tr.innerHTML = '<td>'+name+'</td><td>…</td><td></td>';
+  rows.appendChild(tr);
+  const t0 = performance.now();
+  try{
+    const r = await fetch(url, {cache:'no-store'});
+    const ms = Math.round(performance.now() - t0);
+    const ct = r.headers.get('content-type') || '';
+    let detail = 'HTTP '+r.status+' / '+ct.slice(0,38)+' / '+ms+'ms';
+    let cls = 'ok', label = 'OK';
+
+    if (kind === 'html'){
+      const b = await r.text();
+      detail += ' / '+b.length+'B';
+      if (r.status !== 200 || !/<html/i.test(b)) { cls='ng'; label='NG'; }
+      else if (!b.includes('data-srp-version')) { cls='warn'; label='WARN(shim無し)'; }
+    } else if (kind === 'rewriteCount'){
+      const b = await r.text();
+      const n = (b.match(/\\/__p__\\//g) || []).length;
+      const left = b.match(/https?:\\/\\/[a-z0-9.\\-]*(?:spotify\\.com|scdn\\.co|spotifycdn\\.com)/gi) || [];
+      detail = '書き換え '+n+' 箇所 / 素の絶対URL残存 '+left.length+' 件';
+      if (n < 5) { cls='ng'; label='NG'; }
+      else if (left.length) { cls='warn'; label='WARN(残存'+left.length+')'; }
+    } else if (kind === 'js'){
+      const b = await r.text();
+      const n = (b.match(/\\/__p__\\//g) || []).length;
+      detail += ' / '+(b.length/1024).toFixed(0)+'KB / 書き換え'+n+'箇所';
+      if (r.status !== 200) { cls='ng'; label='NG'; }
+      else if (!n) { cls='warn'; label='WARN(書換0)'; }
+    } else if (kind === 'json401'){
+      const b = await r.text();
+      detail += ' body='+b.slice(0,80).replace(/\\s+/g,' ');
+      // 401 = Spotify に到達したが未認証 = プロキシとしては正常
+      if (isProxyError(r.status, b)) { cls='ng'; label='NG'; }
+    } else if (kind === 'json'){
+      const b = await r.text();
+      detail += ' body='+b.slice(0,70).replace(/\\s+/g,' ');
+      if (isProxyError(r.status, b)) { cls='ng'; label='NG'; }
+    } else if (kind === 'redirect'){
+      detail += ' loc='+(r.headers.get('location')||'-').slice(0,60);
+      if (isProxyError(r.status, await r.clone().text())) { cls='ng'; label='NG'; }
+      else if (r.status < 300 || r.status >= 400) { cls='warn'; label='WARN'; }
+    } else if (kind === 'img'){
+      const b = await r.arrayBuffer();
+      detail += ' / '+b.byteLength+'B';
+      if (r.status !== 200 || b.byteLength < 500) { cls='ng'; label='NG'; }
+    } else { // reachable
+      const b = await r.text();
+      detail += ' body='+b.slice(0,60).replace(/\\s+/g,' ');
+      if (isProxyError(r.status, b)) { cls='ng'; label='NG'; }
     }
+    tr.children[1].innerHTML = '<span class="'+cls+'">'+label+'</span>';
+    tr.children[2].textContent = detail;
+    log((cls==='ok'?'[OK]  ':cls==='warn'?'[WARN]':'[NG]  ') + name + ' -> ' + detail);
+  }catch(e){
+    tr.children[1].innerHTML = '<span class="ng">ERR</span>';
+    tr.children[2].textContent = e.message;
+    log('[ERR] ' + name + ' -> ' + e.message);
   }
+}
+
+document.getElementById('sw').onclick = async () => {
+  if (!('serviceWorker' in navigator)) return log('Service Worker 非対応ブラウザです');
+  const r = await navigator.serviceWorker.getRegistration('/');
+  log(r ? ('SW 登録あり: scope='+r.scope+' active='+(!!r.active)+' state='+(r.active&&r.active.state))
+        : 'SW 未登録（ページをリロードしてください）');
+  log('controller='+(navigator.serviceWorker.controller ? 'あり（このページは制御下）' : 'なし（リロードが必要）'));
+};
+document.getElementById('shim').onclick = () => {
+  log('shim 導入='+(window.__srpInstalled ? 'はい' : 'いいえ') +
+      ' / stats=' + JSON.stringify(window.__srp_stats || null));
+  const l = window.__srp_log || [];
+  log('書き換えログ ' + l.length + ' 件（先頭10）:');
+  l.slice(0,10).forEach(x => log('   ' + x));
+};
+document.getElementById('run').onclick = async () => {
+  rows.innerHTML = ''; logEl.textContent = '';
+  log('controller=' + (navigator.serviceWorker.controller ? 'あり' : 'なし'));
+  log('shim=' + (window.__srpInstalled ? 'v' + (window.__srp_ver || '?') : '未導入'));
+  const T = await buildTargets();
+  for (const [n, u, k] of T) await runOne(n, u, k);
   log('--- 完了 ---');
 };
 </script></body></html>`;
@@ -736,15 +848,18 @@ function createWebPlayer(o = {}) {
     });
   }
 
-  /** Location ヘッダ（リダイレクト先）を自オリジン形に書き換える */
-  function rewriteLocation(loc) {
+  /**
+   * Location ヘッダ（リダイレクト先）を自オリジンの絶対 URL に書き換える。
+   * 相対だと JS 側の new URL() で壊れるため、必ず絶対形で返す。
+   */
+  function rewriteLocation(loc, origin) {
     if (!loc) return loc;
     try {
       const u = new URL(loc, 'https://open.spotify.com');
       if (!isSpotifyHost(u.hostname)) return loc; // Spotify 以外はそのまま
-      return `${P}${u.hostname}${u.pathname}${u.search}`;
+      return `${origin || ''}${P}${u.hostname}${u.pathname}${u.search}`;
     } catch {
-      return rewriteText(loc);
+      return rewriteText(loc, origin);
     }
   }
 
@@ -755,6 +870,7 @@ function createWebPlayer(o = {}) {
    */
   function proxy(req, res, host, path) {
     const t0 = Date.now();
+    const origin = originOf(req);       // 書き換え後の絶対 URL の基準
     const headers = upstreamHeaders(req, host, path);
 
     const up = https.request(
@@ -778,7 +894,7 @@ function createWebPlayer(o = {}) {
         }
         const sc = rewriteSetCookie(ures.headers['set-cookie']);
         if (sc) sc.forEach((c) => outHeaders.push('Set-Cookie', c));
-        if (ures.headers.location) outHeaders.push('Location', rewriteLocation(ures.headers.location));
+        if (ures.headers.location) outHeaders.push('Location', rewriteLocation(ures.headers.location, origin));
 
         pushRing(reqLog, {
           t: Date.now(), host, path: String(path).slice(0, 220),
@@ -834,11 +950,14 @@ function createWebPlayer(o = {}) {
           if (tooBig) return;
           let body = Buffer.concat(chunks).toString('utf8');
           const before = body.length;
+          const ok2xx = (ures.statusCode || 0) >= 200 && (ures.statusCode || 0) < 300;
           if (/text\/html/i.test(ct)) {
-            body = injectHtml(body);
-            body = rewriteText(body);
+            // シム注入は正常応答の HTML ドキュメントに限定する
+            // (CDN が返す 404 エラーページ等に注入しても意味がなく肥大化するだけ)
+            if (ok2xx) body = injectHtml(body);
+            body = rewriteText(body, origin);
           } else {
-            body = rewriteText(body);
+            body = rewriteText(body, origin);
           }
           const gz = zlib.gzipSync(Buffer.from(body, 'utf8'));
           // Node の writeHead 配列形式は「フラットな [key, value, key, value, ...]」
