@@ -85,31 +85,149 @@ function rewriteText(text) {
   return out;
 }
 
-/** HTML に Service Worker 登録 + WebSocket シムを注入する */
+/**
+ * HTML の <head> 直後に注入するシム。
+ *
+ * ★ なぜ Service Worker だけでは不十分か
+ *   SW は「登録された次のナビゲーション」からしかページを制御できない。
+ *   つまり初回ロードでは SW が効いておらず、JS が実行時に組み立てた
+ *   https://api.spotify.com/... 等がそのまま Spotify に直行して失敗する
+ *   (ブロック下ではそこで "エラーが発生したようです" 画面になる)。
+ *
+ *   そこで fetch / XHR / WebSocket / sendBeacon / 動的 src を
+ *   『同期的に・初回ロードから』書き換えるシムを注入する。
+ *   SW は保険として併用する。
+ */
+const SRP_VERSION = '2';
+
 const INJECT = `
-<script>/* injected by spotify-render-proxy */
+<script data-srp-version="${SRP_VERSION}">/* injected by spotify-render-proxy */
 (function(){
-  var SP=/(^|\\.)(spotify\\.com|scdn\\.co|spotifycdn\\.com|spotilocal\\.com)$/i;
-  try{
-    var NativeWS=window.WebSocket;
-    function PatchedWS(url,protocols){
-      try{
-        var u=new URL(url,location.href);
-        if(u.origin!==location.origin && SP.test(u.hostname)){
-          url=(location.protocol==='https:'?'wss://':'ws://')+location.host+'${W}'+u.hostname+u.pathname+u.search;
-        }
-      }catch(e){}
-      return protocols===undefined?new NativeWS(url):new NativeWS(url,protocols);
+  if (window.__srpInstalled) return;
+  window.__srpInstalled = true;
+
+  var SP = /(^|\\.)(spotify\\.com|scdn\\.co|spotifycdn\\.com|spotilocal\\.com)$/i;
+  var PREFIX = '/__p__/';
+  var WSPREFIX = (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/__ws__/';
+  var log = [];
+  window.__srp_log = log;                 // コンソールから window.__srp_log で確認できる
+  window.__srp_stats = { rewritten: 0, escaped: 0 };
+  function note(kind, from, to) {
+    if (log.length < 400) log.push(kind + ' ' + from + (to ? ' -> ' + to : ''));
+    if (kind === 'ESCAPE') window.__srp_stats.escaped++;
+    else window.__srp_stats.rewritten++;
+    if (kind === 'ESCAPE' && window.console) console.warn('[spotify-proxy] 書き換え漏れ?', from);
+  }
+
+  /** 絶対URL -> 自オリジンのプロキシパス */
+  function rw(u) {
+    if (typeof u !== 'string' || !u) return u;
+    if (u.indexOf(PREFIX) === 0) return u;               // 既にプロキシ形
+    var url;
+    try { url = new URL(u, location.href); } catch (e) { return u; }
+    if (!url.host) return u;
+    if (url.origin === location.origin) return u;        // 自オリジン
+    if (!SP.test(url.hostname)) return u;                // Spotify 以外 (Google 等) は素通し
+    var out = PREFIX + url.hostname + url.pathname + url.search;
+    note('rewrite', u, out);
+    return out;
+  }
+
+  // ---------- (1) fetch ----------
+  try {
+    var origFetch = window.fetch;
+    if (origFetch) {
+      window.fetch = function (input, init) {
+        try {
+          if (typeof input === 'string') input = rw(input);
+          else if (input instanceof URL) input = rw(input.href);
+          else if (input && typeof input.url === 'string') {
+            var nu = rw(input.url);
+            if (nu !== input.url) input = new Request(nu, input);
+          }
+        } catch (e) {}
+        return origFetch.call(this, input, init);
+      };
     }
-    PatchedWS.prototype=NativeWS.prototype;
-    ['CONNECTING','OPEN','CLOSING','CLOSED'].forEach(function(k){PatchedWS[k]=NativeWS[k];});
-    window.WebSocket=PatchedWS;
-  }catch(e){console.error('[proxy] WS shim failed',e);}
-  if('serviceWorker' in navigator){
-    navigator.serviceWorker.register('/sw.js',{scope:'/'})
-      .then(function(r){console.log('[proxy] SW registered',r.scope);})
-      .catch(function(e){console.error('[proxy] SW registration FAILED',e);});
-  }else{console.warn('[proxy] Service Worker not supported');}
+  } catch (e) { console.error('[spotify-proxy] fetch shim failed', e); }
+
+  // ---------- (2) XMLHttpRequest ----------
+  try {
+    var origOpen = XMLHttpRequest.prototype.open;
+    XMLHttpRequest.prototype.open = function (method, url) {
+      try { if (arguments.length > 1) arguments[1] = rw(url); } catch (e) {}
+      return origOpen.apply(this, arguments);
+    };
+  } catch (e) { console.error('[spotify-proxy] XHR shim failed', e); }
+
+  // ---------- (3) WebSocket (SW では傍受できないため必須) ----------
+  try {
+    var NativeWS = window.WebSocket;
+    function PatchedWS(url, protocols) {
+      try {
+        var u = new URL(url, location.href);
+        if (u.origin !== location.origin && SP.test(u.hostname)) {
+          var nu = WSPREFIX + u.hostname + u.pathname + u.search;
+          note('ws-rewrite', url, nu);
+          url = nu;
+        }
+      } catch (e) {}
+      return protocols === undefined ? new NativeWS(url) : new NativeWS(url, protocols);
+    }
+    PatchedWS.prototype = NativeWS.prototype;
+    ['CONNECTING', 'OPEN', 'CLOSING', 'CLOSED'].forEach(function (k) { PatchedWS[k] = NativeWS[k]; });
+    window.WebSocket = PatchedWS;
+  } catch (e) { console.error('[spotify-proxy] WS shim failed', e); }
+
+  // ---------- (4) navigator.sendBeacon ----------
+  try {
+    if (navigator.sendBeacon) {
+      var origBeacon = navigator.sendBeacon.bind(navigator);
+      navigator.sendBeacon = function (u, d) { return origBeacon(rw(u), d); };
+    }
+  } catch (e) {}
+
+  // ---------- (5) 動的に設定される src / href ----------
+  try {
+    [['HTMLImageElement', 'src'], ['HTMLScriptElement', 'src'], ['HTMLMediaElement', 'src'],
+     ['HTMLSourceElement', 'src'], ['HTMLIFrameElement', 'src'], ['HTMLLinkElement', 'href']
+    ].forEach(function (pair) {
+      var Ctor = window[pair[0]], prop = pair[1];
+      if (!Ctor || !Ctor.prototype) return;
+      var d = Object.getOwnPropertyDescriptor(Ctor.prototype, prop);
+      if (!d || !d.set || !d.get) return;
+      Object.defineProperty(Ctor.prototype, prop, {
+        configurable: true, enumerable: d.enumerable,
+        get: function () { return d.get.call(this); },
+        set: function (v) { try { v = rw(v); } catch (e) {} d.set.call(this, v); },
+      });
+    });
+  } catch (e) { console.error('[spotify-proxy] src shim failed', e); }
+
+  // ---------- (6) 書き換え漏れの検出 (診断用) ----------
+  // パッチを通らずに Spotify へ出て行こうとしたリクエストを拾って警告する
+  try {
+    window.addEventListener('error', function (e) {
+      var t = e && e.target;
+      if (t && (t.src || t.href)) {
+        var s = String(t.src || t.href);
+        if (/^(https?:)?\\/\\//.test(s) && SP.test((function () { try { return new URL(s, location.href).hostname; } catch (x) { return ''; } })())) {
+          note('ESCAPE', s);
+        }
+      }
+    }, true);
+  } catch (e) {}
+
+  // ---------- (7) Service Worker (保険) ----------
+  if ('serviceWorker' in navigator) {
+    navigator.serviceWorker.register('/sw.js', { scope: '/' })
+      .then(function (reg) { console.log('[spotify-proxy] SW registered, scope=' + reg.scope +
+        ', controlling=' + !!navigator.serviceWorker.controller); })
+      .catch(function (e) { console.error('[spotify-proxy] SW registration FAILED', e); });
+  }
+
+  console.log('[spotify-proxy] shim v' + document.currentScript.getAttribute('data-srp-version') +
+    ' installed (fetch/XHR/WebSocket/src は初回ロードから書き換え有効)');
 })();
 </script>`;
 
