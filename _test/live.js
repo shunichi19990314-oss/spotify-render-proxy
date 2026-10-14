@@ -93,6 +93,21 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   check('Spotify URL が書き換わっている', rew > 5, `/__p__/ が ${rew} 箇所`);
   const left = html.match(/https?:\/\/[a-z0-9.-]*(?:spotify\.com|scdn\.co|spotifycdn\.com)/gi) || [];
   check('素の Spotify 絶対URL が残っていない', left.length === 0, left.length ? `残${left.length}: ${[...new Set(left)].slice(0, 3).join(', ')}` : 'clean');
+
+  // ★最重要: 相対パスだと Spotify 側の base 引数なし new URL(x) が
+  //   "TypeError: Failed to construct 'URL': Invalid URL" で落ちるため、
+  //   書き換え結果は必ず絶対 URL でなければならない。
+  const proxied = [...new Set((html.match(/https?:\/\/[^"'\s)]*\/__p__\/[^"'\s)]*/g) || []))];
+  check('書き換え結果が絶対URLになっている', proxied.length > 0, `${proxied.length}件 例: ${(proxied[0] || '').slice(0, 62)}`);
+  let urlOk = 0;
+  proxied.forEach((u) => { try { new URL(u); urlOk++; } catch { /* */ } });
+  check('全URLが base なし new URL() でパース可能', proxied.length > 0 && urlOk === proxied.length, `${urlOk}/${proxied.length}`);
+  const htmlNoShim = html.replace(/<script data-srp-version="[\s\S]*?<\/script>/g, '');
+  const relLeft = (htmlNoShim.match(/["'=]\/__p__\//g) || []).length;
+  check('相対形の /__p__/ が残っていない (shim定数を除く)', relLeft === 0, relLeft ? `★${relLeft}箇所 残存` : 'clean');
+  const shimVer = (/data-srp-version="(\d+)"/.exec(html) || [])[1];
+  check('shim v4 以降が注入されている', Number(shimVer) >= 4, `shim v${shimVer}`);
+  check('JSON エスケープ形も絶対URL化', !/"https?:\\\/\\\/[a-z0-9.-]*spotify/.test(html), 'エスケープ形の素URLなし');
   const upCookies = r.headers['set-cookie'] || [];
   check('Set-Cookie から Domain が除去されている', !upCookies.some((c) => /;\s*domain=/i.test(c)),
     `${upCookies.length}個 / ${JSON.stringify(upCookies[0] || '').slice(0, 60)}`);
@@ -130,7 +145,12 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   console.log('\n=== 8. リダイレクトの書き換え ===');
   r = await req('GET', '/__p__/accounts.spotify.com/', { cookie });
   check('accounts.spotify.com に到達', [200, 301, 302, 303, 307].includes(r.status), `HTTP ${r.status}`);
-  check('Location が /__p__/ 形に書き換わる', !r.headers.location || r.headers.location.startsWith('/'), `loc=${r.headers.location}`);
+  // Location も「絶対 URL」でなければならない（相対だと Spotify の new URL() が壊れる）
+  const loc = r.headers.location || '';
+  check('Location が絶対URL + /__p__/ 形に書き換わる',
+        !loc || /^https?:\/\/[^/]+\/__p__\//.test(loc), `loc=${loc}`);
+  check('Location が base なし new URL() でパースできる',
+        !loc || (() => { try { new URL(loc); return true; } catch { return false; } })(), `loc=${loc}`);
   check('Location に素の spotify.com が残らない', !/https?:\/\/[a-z0-9.-]*spotify\.com/i.test(r.headers.location || ''), `loc=${r.headers.location}`);
 
   console.log('\n=== 9. SPA ルーティング ===');
