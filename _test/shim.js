@@ -51,7 +51,17 @@ function makeSandbox(origin) {
   }
 
   const listeners = {};
+  const beacons = [];
+  calls.beacons = beacons;
+  const fakeEl = {
+    tagName: 'DIV', innerHTML: '', style: {}, setAttribute() {}, appendChild() {},
+    addEventListener() {}, innerText: '',
+  };
   const sandbox = {
+    Blob: function (parts, opts) { this.parts = parts; this.type = (opts || {}).type; },
+    // タイマーは登録だけ記録して実行しない（テストを決定論的にするため）
+    setTimeout: (fn, ms) => { (calls.timers = calls.timers || []).push(ms); return calls.timers.length; },
+    setInterval: (fn, ms) => { (calls.intervals = calls.intervals || []).push(ms); return 999; },
     URL: URLImpl,
     Request: FakeRequest,
     XMLHttpRequest: FakeXHR,
@@ -62,11 +72,19 @@ function makeSandbox(origin) {
     console: { log: () => {}, warn: (a) => calls.fetch.push('WARN:' + a), error: (a) => calls.fetch.push('ERR:' + a) },
     sessionStorage: { getItem: () => null, setItem: () => {} },
     navigator: {
-      sendBeacon: (u) => { calls.beacon.push(u); return true; },
-      serviceWorker: { register: () => Promise.resolve({ scope: '/' }) },
+      sendBeacon: (u, blob) => { calls.beacon.push(u); if (blob && blob.parts) beacons.push(blob.parts.join('')); return true; },
+      serviceWorker: { register: () => Promise.resolve({ scope: '/' }), controller: null },
     },
-    addEventListener: (t, f) => { (listeners[t] = listeners[t] || []).push(f); },
-    document: { currentScript: { getAttribute: () => m[1] } },
+    addEventListener: (t, f) => { ((calls.listeners = calls.listeners || {})[t] = calls.listeners[t] || []).push(f); },
+    document: {
+      currentScript: { getAttribute: () => m[1] },
+      title: 'Spotify - Web Player',
+      documentElement: { appendChild: () => {} },
+      body: { innerHTML: '<div>x</div>', innerText: 'エラーが発生したようです' },
+      createElement: () => ({ ...fakeEl }),
+      getElementById: () => null,
+      querySelector: () => null,
+    },
     fetch: function (input, init) {
       calls.fetch.push(typeof input === 'string' ? input : (input && input.url));
       return Promise.resolve({ ok: true });
@@ -146,6 +164,38 @@ console.log('\n--- sendBeacon / 動的 src ---');
 console.log('\n--- 統計 ---');
 console.log('   rewritten:', sb.__srp_stats.rewritten, '/ escaped:', sb.__srp_stats.escaped);
 check('書き換えが実際にカウントされている', sb.__srp_stats.rewritten > 5, `${sb.__srp_stats.rewritten}件`);
+
+console.log('\n--- テレメトリ (コンソール不要の診断) ---');
+{
+  // JS エラーを捕捉できるか
+  calls.beacon.length = 0; calls.beacons.length = 0;
+  const errHandlers = ((calls.listeners || {})['error'] || []);
+  check('error イベントのハンドラが登録されている', errHandlers.length > 0, `${errHandlers.length}個`);
+  if (errHandlers.length) {
+    errHandlers.forEach(f => f({ message: 'TEST BOOM', filename: 'x.js', lineno: 42, target: sb }));
+  }
+  const rejHandlers = ((calls.listeners || {})['unhandledrejection'] || []);
+  check('unhandledrejection ハンドラが登録されている', rejHandlers.length > 0, `${rejHandlers.length}個`);
+  rejHandlers.forEach(f => f({ reason: new Error('TEST REJECT') }));
+
+  // 手動でレポート送信
+  sb.__srp_report();
+  check('__srp_report() が sendBeacon を呼ぶ', calls.beacon.includes('/__report__'), `宛先=${calls.beacon[0]}`);
+  let rep = null;
+  try { rep = JSON.parse(calls.beacons[0]); } catch (e) { /* */ }
+  check('レポートが JSON として送られる', !!rep);
+  if (rep) {
+    check('shim バージョンを含む', String(rep.v) === m[1], `v=${rep.v}`);
+    check('書き換え統計を含む', rep.stats && typeof rep.stats.rewritten === 'number', JSON.stringify(rep.stats));
+    check('書き換えログを含む', Array.isArray(rep.log) && rep.log.length > 0, `${(rep.log || []).length}件`);
+    check('JSエラーを捕捉している', (rep.errors || []).some(e => /TEST BOOM/.test(e)), JSON.stringify((rep.errors || []).slice(0, 2)));
+    check('unhandledrejection を捕捉している', (rep.errors || []).some(e => /TEST REJECT/.test(e)));
+    check('エラー画面を検出できる', rep.boot && rep.boot.errorScreen === true, `errorScreen=${rep.boot && rep.boot.errorScreen}`);
+    check('SW制御状態を報告する', rep.swController === false, `swController=${rep.swController}`);
+  }
+  const snap = sb.__srp_snapshot();
+  check('__srp_snapshot() が直接呼べる', snap && snap.v === m[1]);
+}
 
 console.log(`\n${'='.repeat(66)}`);
 console.log(`shim 検証結果: ${pass} pass / ${fail} fail`);

@@ -7,7 +7,7 @@ const BASE = process.env.BASE || 'spotify-88jy.onrender.com';
 const TOKEN = process.env.TK || '';
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36';
 
-function req(method, path, { cookie, headers = {} } = {}) {
+function req(method, path, { cookie, headers = {}, body } = {}) {
   return new Promise((resolve) => {
     const h = { 'User-Agent': UA, ...headers };
     if (cookie) h.Cookie = cookie;
@@ -27,6 +27,7 @@ function req(method, path, { cookie, headers = {} } = {}) {
     });
     rq.on('error', (e) => resolve({ err: e.message }));
     rq.setTimeout(90000, () => { rq.destroy(); resolve({ err: 'timeout(90s)' }); });
+    if (body) rq.write(body);
     rq.end();
   });
 }

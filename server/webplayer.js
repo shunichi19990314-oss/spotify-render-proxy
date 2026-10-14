@@ -98,7 +98,7 @@ function rewriteText(text) {
  *   『同期的に・初回ロードから』書き換えるシムを注入する。
  *   SW は保険として併用する。
  */
-const SRP_VERSION = '2';
+const SRP_VERSION = '3';
 
 const INJECT = `
 <script data-srp-version="${SRP_VERSION}">/* injected by spotify-render-proxy */
@@ -221,12 +221,107 @@ const INJECT = `
   // ---------- (7) Service Worker (保険) ----------
   if ('serviceWorker' in navigator) {
     navigator.serviceWorker.register('/sw.js', { scope: '/' })
-      .then(function (reg) { console.log('[spotify-proxy] SW registered, scope=' + reg.scope +
-        ', controlling=' + !!navigator.serviceWorker.controller); })
+      .then(function (reg) {
+        console.log('[spotify-proxy] SW registered, scope=' + reg.scope +
+          ', controlling=' + !!navigator.serviceWorker.controller);
+      })
       .catch(function (e) { console.error('[spotify-proxy] SW registration FAILED', e); });
   }
 
-  console.log('[spotify-proxy] shim v' + document.currentScript.getAttribute('data-srp-version') +
+  // ---------- (8) JS エラーの収集 ----------
+  // DevTools を開けない環境でも原因を追えるよう、エラーをサーバへ送る。
+  var errors = [];
+  function pushErr(s) {
+    s = String(s).slice(0, 400);
+    if (errors.length < 60 && errors.indexOf(s) === -1) errors.push(s);
+  }
+  window.addEventListener('error', function (e) {
+    var t = e && e.target;
+    if (t && t !== window && (t.src || t.href)) {
+      pushErr('resource-load-failed: ' + (t.tagName || '?') + ' ' + (t.src || t.href));
+      return;
+    }
+    pushErr('onerror: ' + (e && e.message) + ' @' + (e && e.filename) + ':' + (e && e.lineno));
+  }, true);
+  window.addEventListener('unhandledrejection', function (e) {
+    var r = e && e.reason;
+    pushErr('unhandledrejection: ' + ((r && (r.message || r.statusText)) || r));
+  });
+  var origErr = console.error;
+  try {
+    console.error = function () {
+      try { pushErr('console.error: ' + Array.prototype.slice.call(arguments).map(String).join(' ').slice(0, 300)); } catch (x) {}
+      return origErr.apply(this, arguments);
+    };
+  } catch (e) {}
+
+  // ---------- (9) サーバへの診断レポート送信 ----------
+  var VER = document.currentScript ? document.currentScript.getAttribute('data-srp-version') : '?';
+  function snapshot() {
+    return {
+      v: VER,
+      href: location.href.slice(0, 200),
+      swController: !!(navigator.serviceWorker && navigator.serviceWorker.controller),
+      stats: window.__srp_stats,
+      log: log.slice(-120),
+      errors: errors.slice(-40),
+      boot: {
+        title: (document.title || '').slice(0, 80),
+        bodyLen: (document.body ? document.body.innerHTML.length : 0),
+        // Spotify のエラー画面が出ていないか
+        errorScreen: /エラーが発生した|Something went wrong|page could not be loaded/i.test(
+          document.body ? document.body.innerText.slice(0, 4000) : ''),
+        hasRoot: !!document.getElementById('main') || !!document.querySelector('#app,#root,[data-testid]'),
+      },
+    };
+  }
+  function report() {
+    try {
+      var payload = JSON.stringify(snapshot());
+      if (navigator.sendBeacon) {
+        navigator.sendBeacon('/__report__', new Blob([payload], { type: 'application/json' }));
+      } else {
+        origFetch.call(window, '/__report__', {
+          method: 'POST', headers: { 'content-type': 'application/json' }, body: payload, keepalive: true,
+        });
+      }
+    } catch (e) {}
+  }
+  window.__srp_report = report;      // 手動送信用
+  window.__srp_snapshot = snapshot;  // 状態確認用
+  // 起動直後から一定間隔で送る（初回ロードの問題を確実に捕捉する）
+  [2000, 6000, 12000, 25000, 45000].forEach(function (ms) { setTimeout(report, ms); });
+  window.addEventListener('pagehide', report);
+
+  // ---------- (10) 画面上のステータスバッジ（コンソール不要で状態が見える）----------
+  try {
+    var badge = document.createElement('div');
+    badge.id = '__srp_badge';
+    badge.setAttribute('style',
+      'all:initial;position:fixed;right:10px;bottom:10px;z-index:2147483647;' +
+      'background:rgba(18,18,18,.94);color:#eaeaea;border:1px solid #1db954;border-radius:8px;' +
+      'padding:7px 10px;font:12px/1.5 system-ui,sans-serif;cursor:pointer;max-width:290px;' +
+      'box-shadow:0 2px 10px rgba(0,0,0,.5)');
+    document.documentElement.appendChild(badge);
+    function paint() {
+      var st = window.__srp_stats;
+      var bad = errors.length || st.escaped;
+      badge.innerHTML =
+        '<div style="color:#1db954;font-weight:700">spotify-proxy shim v' + VER + '</div>' +
+        '<div>URL書換 <b style="color:#1db954">' + st.rewritten + '</b> / 逃し <b style="color:' +
+          (st.escaped ? '#ff6b6b' : '#1db954') + '">' + st.escaped + '</b> / エラー <b style="color:' +
+          (errors.length ? '#ff6b6b' : '#1db954') + '">' + errors.length + '</b></div>' +
+        '<div style="color:#999;font-size:11px">SW制御: ' +
+          (navigator.serviceWorker && navigator.serviceWorker.controller ? 'あり' : 'なし') +
+          ' — クリックで詳細ログ</div>';
+      badge.style.borderColor = bad ? '#ff6b6b' : '#1db954';
+    }
+    paint();
+    setInterval(function () { paint(); report(); }, 8000);
+    badge.addEventListener('click', function () { window.open('/__log__', '_blank'); });
+  } catch (e) {}
+
+  console.log('[spotify-proxy] shim v' + VER +
     ' installed (fetch/XHR/WebSocket/src は初回ロードから書き換え有効)');
 })();
 </script>`;
@@ -245,6 +340,22 @@ function decompressor(encoding) {
   if (e.includes('gzip')) return zlib.createGunzip();
   if (e.includes('deflate')) return zlib.createInflate();
   return null;
+}
+
+// ------------------------------------------------------------------ テレメトリ
+// コンソール/DevTools を使えない環境でも診断できるように、
+// ①プロキシした全リクエスト ②ブラウザ側から送られてきた診断レポート を
+// サーバのメモリ上に保持し、/__log__ から JSON で取り出せるようにする。
+const MAX_REQ_LOG = Number(process.env.LOG_REQ || 400);
+const MAX_ERR_LOG = 200;
+const MAX_REPORTS = 40;
+const reqLog = [];
+const errLog = [];
+const reports = [];
+
+function pushRing(arr, item, max) {
+  arr.push(item);
+  while (arr.length > max) arr.shift();
 }
 
 // ------------------------------------------------------------------ Service Worker
@@ -382,6 +493,134 @@ function stripAuthCookie(cookieHeader) {
     .map((s) => s.trim())
     .filter((kv) => kv && kv.split('=')[0] !== AUTH_COOKIE)
     .join('; ');
+}
+
+/** /__log__ の HTML ダッシュボード。DevTools を使えない環境でもブラウザだけで診断できる */
+function logPage(payload) {
+  const data = JSON.stringify(payload).replace(/</g, '\\u003c');
+  return `<!DOCTYPE html><html lang="ja"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>spotify-render-proxy ログ</title>
+<style>
+ body{font:13px/1.55 -apple-system,Segoe UI,Roboto,sans-serif;background:#121212;color:#eaeaea;margin:0;padding:18px}
+ h1{font-size:17px;margin:0 0 4px} h2{font-size:14px;margin:22px 0 6px;color:#1db954}
+ .sub{color:#999;font-size:12px;margin-bottom:10px}
+ button{background:#1db954;color:#000;border:0;padding:8px 16px;border-radius:18px;font-weight:700;cursor:pointer;font-size:12px;margin-right:8px}
+ button.sec{background:#333;color:#fff}
+ table{border-collapse:collapse;width:100%;margin-bottom:6px;font-size:12px}
+ th,td{border-bottom:1px solid #2a2a2a;padding:4px 7px;text-align:left;vertical-align:top;word-break:break-all}
+ th{background:#1c1c1c;color:#aaa;position:sticky;top:0}
+ tr.bad td{background:#3a1d1d} tr.warn td{background:#3a321d}
+ .n{color:#1db954;font-weight:700} .b{color:#ff6b6b;font-weight:700} .y{color:#ffb020;font-weight:700}
+ pre{background:#000;padding:10px;border-radius:6px;overflow:auto;font:11px/1.5 monospace;max-height:340px;white-space:pre-wrap}
+ .box{background:#181818;border:1px solid #282828;border-radius:8px;padding:12px;margin-bottom:10px}
+ .kv{display:flex;gap:18px;flex-wrap:wrap}
+ .kv div{background:#1c1c1c;padding:8px 12px;border-radius:6px}
+ .kv b{display:block;font-size:19px;color:#1db954}
+ code{background:#222;padding:1px 5px;border-radius:3px;color:#1db954}
+ a{color:#1db954}
+</style></head><body>
+<h1>📋 spotify-render-proxy ログ</h1>
+<div class="sub">このページはコンソール不要で診断情報を確認できます。自動更新: 5秒ごと</div>
+<div>
+  <button onclick="load()">今すぐ更新</button>
+  <button class="sec" onclick="location.href='/'">Web Player を開く</button>
+  <button class="sec" onclick="location.href='/__diag__'">接続テスト</button>
+  <label style="font-size:12px;color:#aaa"><input type="checkbox" id="auto" checked> 自動更新</label>
+</div>
+<div class="box" id="sum" style="margin-top:14px"></div>
+<h2>① ブラウザから届いた診断レポート（最重要）</h2>
+<div id="reports">読み込み中…</div>
+<h2>② エラー（4xx / 5xx / アップストリーム失敗）</h2>
+<div id="errors">読み込み中…</div>
+<h2>③ プロキシしたリクエスト（新しい順）</h2>
+<div id="reqs">読み込み中…</div>
+<h2>④ 生 JSON</h2>
+<pre id="raw">読み込み中…</pre>
+<script>
+let DATA=null;
+const esc=s=>String(s==null?'':s).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+const ago=t=>{const s=Math.max(0,Math.round((Date.now()-t)/1000));return s<60?s+'秒前':Math.floor(s/60)+'分前'};
+function statusCls(s){return s>=500?'b':s>=400?'y':'n'}
+async function load(){
+  try{
+    const r=await fetch('/__log__.json',{cache:'no-store'});
+    DATA=await r.json();
+    render();
+  }catch(e){document.getElementById('sum').innerHTML='<span class="b">取得失敗: '+esc(e.message)+'</span>';}
+}
+function render(){
+  const d=DATA;
+  document.getElementById('sum').innerHTML=
+    '<div class="kv">'+
+    '<div><b>'+d.counters.requests+'</b>リクエスト</div>'+
+    '<div><b>'+d.counters.errors+'</b>エラー</div>'+
+    '<div><b>'+d.counters.reports+'</b>レポート</div>'+
+    '<div><b>'+esc(d.generatedAt.slice(11,19))+'</b>更新時刻</div>'+
+    '</div>';
+
+  // ① レポート
+  if(!d.reports.length){
+    document.getElementById('reports').innerHTML='<div class="box"><span class="y">まだレポートが届いていません。</span><br>'+
+      'Web Player (<a href="/">/</a>) を開いて 10 秒ほど待つと、ここに診断情報が自動的に送られてきます。</div>';
+  } else {
+    let h='<table><tr><th>時刻</th><th>shim</th><th>SW制御</th><th>書換</th><th>逃し</th><th>エラー</th><th>ページ</th></tr>';
+    d.reports.forEach(r=>{
+      const errN=(r.errors||[]).length;
+      h+='<tr class="'+(errN?'bad':(r.stats&&r.stats.escaped?'warn':''))+'">'+
+         '<td>'+ago(r.t)+'</td><td>'+esc(r.v)+'</td>'+
+         '<td>'+(r.swController?'<span class="n">はい</span>':'<span class="y">いいえ</span>')+'</td>'+
+         '<td class="n">'+((r.stats&&r.stats.rewritten)||0)+'</td>'+
+         '<td class="'+((r.stats&&r.stats.escaped)?'b':'n')+'">'+((r.stats&&r.stats.escaped)||0)+'</td>'+
+         '<td class="'+(errN?'b':'n')+'">'+errN+'</td>'+
+         '<td>'+esc((r.href||'').slice(0,60))+'</td></tr>';
+    });
+    h+='</table>';
+    d.reports.slice(0,4).forEach((r,i)=>{
+      if((r.errors||[]).length || (r.log||[]).filter(x=>/ESCAPE/.test(x)).length){
+        h+='<div class="box"><b>レポート #'+(i+1)+' の詳細 ('+ago(r.t)+')</b>';
+        if((r.errors||[]).length){
+          h+='<div style="margin-top:6px"><span class="b">■ JS エラー ('+r.errors.length+')</span><pre>'+
+             r.errors.map(esc).join('\\n')+'</pre></div>';
+        }
+        const esc_=(r.log||[]).filter(x=>/ESCAPE/.test(x));
+        if(esc_.length){
+          h+='<div style="margin-top:6px"><span class="y">■ 書き換え漏れ ('+esc_.length+')</span><pre>'+
+             esc_.map(esc).join('\\n')+'</pre></div>';
+        }
+        h+='</div>';
+      }
+    });
+    document.getElementById('reports').innerHTML=h;
+  }
+
+  // ② エラー
+  if(!d.errors.length){document.getElementById('errors').innerHTML='<div class="box"><span class="n">エラーなし</span></div>';}
+  else{
+    let h='<table><tr><th>時刻</th><th>種別</th><th>status/code</th><th>host</th><th>path</th></tr>';
+    d.errors.slice(0,60).forEach(e=>{
+      h+='<tr class="bad"><td>'+ago(e.t)+'</td><td>'+esc(e.kind)+'</td>'+
+         '<td class="b">'+esc(e.status||e.code||'')+'</td><td>'+esc(e.host)+'</td><td>'+esc(e.path)+'</td></tr>';
+    });
+    document.getElementById('errors').innerHTML=h+'</table>';
+  }
+
+  // ③ リクエスト
+  {
+    let h='<table><tr><th>時刻</th><th>status</th><th>ms</th><th>host</th><th>path</th></tr>';
+    d.requests.slice(0,80).forEach(r=>{
+      h+='<tr class="'+(r.status>=400?'bad':'')+'"><td>'+ago(r.t)+'</td>'+
+         '<td class="'+statusCls(r.status)+'">'+r.status+'</td><td>'+r.ms+'</td>'+
+         '<td>'+esc(r.host)+'</td><td>'+esc((r.path||'').slice(0,90))+'</td></tr>';
+    });
+    document.getElementById('reqs').innerHTML=h+'</table>';
+  }
+
+  document.getElementById('raw').textContent=JSON.stringify(d.reports.slice(0,3),null,1);
+}
+load();
+setInterval(()=>{if(document.getElementById('auto').checked)load()},5000);
+</script></body></html>`;
 }
 
 /** トークン入力ページ（?t= で受け取り HttpOnly Cookie を焼いてから / へ） */
@@ -541,6 +780,15 @@ function createWebPlayer(o = {}) {
         if (sc) sc.forEach((c) => outHeaders.push('Set-Cookie', c));
         if (ures.headers.location) outHeaders.push('Location', rewriteLocation(ures.headers.location));
 
+        pushRing(reqLog, {
+          t: Date.now(), host, path: String(path).slice(0, 220),
+          status: ures.statusCode, ms: Date.now() - t0,
+          ct: ct.slice(0, 40), bytes: Number(ures.headers['content-length'] || 0),
+        }, MAX_REQ_LOG);
+        if (ures.statusCode >= 400) {
+          pushRing(errLog, { t: Date.now(), kind: 'http', host, path: String(path).slice(0, 220), status: ures.statusCode }, MAX_ERR_LOG);
+        }
+
         // ---- バイナリ（音声・画像等）はストリーム素通し
         if (!needRewrite) {
           res.writeHead(ures.statusCode || 502, outHeaders.slice());
@@ -611,6 +859,7 @@ function createWebPlayer(o = {}) {
 
     up.on('error', (e) => {
       warn(`proxy fail ${host}${path} -> ${e.code || e.message}`);
+      pushRing(errLog, { t: Date.now(), kind: 'upstream', host, path: String(path).slice(0, 220), code: e.code || e.message }, MAX_ERR_LOG);
       if (!res.headersSent) {
         res.writeHead(502, { 'content-type': 'text/plain; charset=utf-8' });
         res.end(`[spotify-render-proxy] upstream error: ${e.code || e.message}\nhost=${host} path=${path}\n`);
@@ -716,6 +965,65 @@ function createWebPlayer(o = {}) {
       const body = Buffer.from(diagPage(), 'utf8');
       res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Content-Length': body.length, 'Cache-Control': 'no-store' });
       res.end(body);
+      return true;
+    }
+
+    // ---- ブラウザからの診断レポート受信 (コンソール不要の要)
+    //      注入した shim が fetch/sendBeacon で POST してくる。
+    if (pathname === '/__report__') {
+      const chunks = [];
+      let size = 0;
+      req.on('data', (c) => {
+        size += c.length;
+        if (size > 512 * 1024) { req.destroy(); return; }   // 512KB 上限
+        chunks.push(c);
+      });
+      req.on('end', () => {
+        let parsed = null;
+        try { parsed = JSON.parse(Buffer.concat(chunks).toString('utf8')); } catch { /* ignore */ }
+        if (parsed && typeof parsed === 'object') {
+          pushRing(reports, {
+            t: Date.now(),
+            ip: (req.headers['x-forwarded-for'] || req.socket.remoteAddress || '').toString().split(',')[0].trim(),
+            v: String(parsed.v || '').slice(0, 10),
+            href: String(parsed.href || '').slice(0, 200),
+            swController: parsed.swController === true,
+            stats: parsed.stats || {},
+            log: Array.isArray(parsed.log) ? parsed.log.slice(-120).map((x) => String(x).slice(0, 240)) : [],
+            errors: Array.isArray(parsed.errors) ? parsed.errors.slice(-40).map((x) => String(x).slice(0, 400)) : [],
+            boot: parsed.boot || {},
+          }, MAX_REPORTS);
+        }
+        res.writeHead(204, { 'Cache-Control': 'no-store' });
+        res.end();
+      });
+      req.on('error', () => { if (!res.headersSent) res.writeHead(400).end(); });
+      return true;
+    }
+
+    // ---- 収集したログの出力
+    //      /__log__.json : 機械可読 (サンドボックスから取得して解析する)
+    //      /__log__      : HTML ダッシュボード (コンソール不要でブラウザから確認できる)
+    if (pathname === '/__log__.json' || pathname === '/__log__') {
+      const payload = {
+        generatedAt: new Date().toISOString(),
+        counters: { requests: reqLog.length, errors: errLog.length, reports: reports.length },
+        // 直近のエラー (4xx/5xx とアップストリーム失敗)
+        errors: errLog.slice(-60).reverse(),
+        // ブラウザから届いた診断レポート (新しい順)
+        reports: reports.slice(-12).reverse(),
+        // 直近のリクエスト
+        requests: reqLog.slice(-120).reverse(),
+      };
+      if (pathname === '/__log__.json') {
+        const b = Buffer.from(JSON.stringify(payload, null, 1), 'utf8');
+        res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Content-Length': b.length, 'Cache-Control': 'no-store' });
+        res.end(b);
+        return true;
+      }
+      const b = Buffer.from(logPage(payload), 'utf8');
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Content-Length': b.length, 'Cache-Control': 'no-store' });
+      res.end(b);
       return true;
     }
 

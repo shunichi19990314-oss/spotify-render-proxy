@@ -7,7 +7,7 @@ const HOST = '127.0.0.1';
 const PORT = Number(process.env.WPORT || 18080);
 const TOKEN = process.env.WTOKEN || 'goodtoken-abcdef123456';
 
-function req(method, path, { cookie, headers = {} } = {}) {
+function req(method, path, { cookie, headers = {}, body } = {}) {
   return new Promise((resolve, reject) => {
     const h = { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/122.0 Safari/537.36', ...headers };
     if (cookie) h.Cookie = cookie;
@@ -27,6 +27,7 @@ function req(method, path, { cookie, headers = {} } = {}) {
     });
     rq.on('error', reject);
     rq.setTimeout(30000, () => { rq.destroy(new Error('timeout')); });
+    if (body) rq.write(body);
     rq.end();
   });
 }
@@ -70,6 +71,10 @@ function check(name, cond, detail) {
   check('CSP ヘッダが除去されている', !r.headers['content-security-policy'], r.headers['content-security-policy'] ? '残っている!' : 'removed');
   check('x-frame-options が除去されている', !r.headers['x-frame-options']);
   check('SW 登録コードが注入されている', html.includes("serviceWorker.register('/sw.js'"));
+  check('shim v3 (同期パッチ) が注入されている', /data-srp-version="3"/.test(html) && html.includes('XMLHttpRequest.prototype.open'));
+  check('fetch の同期パッチが入っている', html.includes('window.fetch = function'));
+  check('画面バッジが注入されている', html.includes('__srp_badge'));
+  check('テレメトリ送信が入っている', html.includes('/__report__'));
   check('WebSocket シムが注入されている', html.includes('NativeWS') && html.includes('/__ws__/'));
   const rewritten = (html.match(/\/__p__\//g) || []).length;
   check('Spotify URL が書き換わっている', rewritten > 5, `/__p__/ が ${rewritten} 箇所`);
@@ -122,6 +127,38 @@ function check(name, cond, detail) {
   r = await req('GET', '/__diag__', { cookie });
   check('/__diag__ が 200', r.status === 200 && text(r).includes('診断'), `HTTP ${r.status}`);
 
+  console.log('\n=== 11b. テレメトリ (/__report__ と /__log__) ===');
+  {
+    const report = {
+      v: '3', href: 'https://example/', swController: false,
+      stats: { rewritten: 42, escaped: 2 },
+      log: ['rewrite https://api.spotify.com/x -> /__p__/api.spotify.com/x', 'ESCAPE https://dealer.spotify.com/y'],
+      errors: ['onerror: TEST BOOM @x.js:42', 'unhandledrejection: TEST REJECT'],
+      boot: { title: 'Spotify', bodyLen: 1234, errorScreen: true, hasRoot: false },
+    };
+    const body = Buffer.from(JSON.stringify(report));
+    r = await req('POST', '/__report__', { cookie, body, headers: { 'Content-Type': 'application/json', 'Content-Length': String(body.length) } });
+    check('POST /__report__ が 204', r.status === 204, `HTTP ${r.status}`);
+    r = await req('GET', '/__log__.json', { cookie });
+    let j = null; try { j = JSON.parse(text(r)); } catch { /* */ }
+    check('/__log__.json が JSON を返す', r.status === 200 && !!j, `HTTP ${r.status}`);
+    if (j) {
+      check('レポートが保存されている', j.counters.reports >= 1, `reports=${j.counters.reports}`);
+      const rep = (j.reports || [])[0] || {};
+      check('stats が記録されている', rep.stats && rep.stats.rewritten === 42 && rep.stats.escaped === 2, JSON.stringify(rep.stats));
+      check('JSエラーが記録されている', (rep.errors || []).some((e) => /TEST BOOM/.test(e)), JSON.stringify((rep.errors || [])[0] || ''));
+      check('errorScreen が記録されている', rep.boot && rep.boot.errorScreen === true);
+      check('リクエストログが記録されている', j.counters.requests > 0, `requests=${j.counters.requests}`);
+      check('4xx が errors に記録されている', (j.errors || []).length > 0, `errors=${j.counters.errors}`);
+    }
+    r = await req('GET', '/__log__', { cookie });
+    check('/__log__ が HTML ダッシュボード', r.status === 200 && text(r).includes('spotify-render-proxy ログ'), `HTTP ${r.status} ${text(r).length}B`);
+    r = await req('GET', '/__log__.json');
+    check('/__log__.json は認証必須 (401)', r.status === 401, `HTTP ${r.status}`);
+    r = await req('POST', '/__report__', { body: Buffer.from('{}'), headers: { 'Content-Type': 'application/json', 'Content-Length': '2' } });
+    check('/__report__ は認証必須 (401)', r.status === 401, `HTTP ${r.status}`);
+  }
+
   console.log('\n=== 12. 許可外ホストの遮断（オープンプロキシ化防止）===');
   r = await req('GET', '/__p__/example.com/', { cookie });
   check('example.com は 403 で拒否', r.status === 403, `HTTP ${r.status} ${text(r).slice(0,50)}`);
@@ -159,8 +196,10 @@ function check(name, cond, detail) {
   console.log('\n=== 14. 既存のトンネル方式にリグレッションがないか ===');
   r = await req('GET', '/tunnel');
   check('/tunnel がゲートにハイジャックされない (302 でない)', r.status !== 302, `HTTP ${r.status}`);
-  r = await req('CONNECT', '127.0.0.1:19091');
-  check('直接 CONNECT は認証必須 (407)', r.status === 407, `HTTP ${r.status}`);
+  // 注: CONNECT の応答は 'response' ではなく 'connect' イベントで来るため、
+  //     この共通ヘルパでは検証できない (_test/run3.sh の auth.js で検証済み)。
+  r = await req('GET', '/__gate__');
+  check('/__gate__ は何度でも開ける', r.status === 200, `HTTP ${r.status}`);
 
   console.log(`\n${'='.repeat(66)}`);
   console.log(`結果: ${pass} pass / ${fail} fail`);
